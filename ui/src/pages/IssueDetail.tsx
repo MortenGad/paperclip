@@ -122,6 +122,7 @@ import { prefetchIssueThread } from "../lib/issue-thread-queries";
 import { getIssueDetailQueryOptions } from "../lib/issueDetailCache";
 import {
   beginIssueDetailNavigation,
+  recordIssueDetailReadiness,
   ISSUE_DETAIL_CONTENT_MEASURE,
   ISSUE_DETAIL_CONTENT_PAINT_MARK,
   ISSUE_DETAIL_HEADER_MEASURE,
@@ -420,6 +421,7 @@ type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   queueTargetRunId?: string | null;
   queueReason?: "hold" | "active_run" | "other";
   consumedByRunId?: string | null;
+  consumedQueueIds?: string[];
   steeredIntoRunId?: string | null;
   conversationAnchorAt?: Date | string | null;
   conversationAnchorSequence?: number;
@@ -1587,6 +1589,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   });
   const resolvedActivity = activity ?? [];
   const resolvedLinkedRuns = linkedRuns ?? [];
+  useEffect(() => {
+    recordIssueDetailReadiness({ activity: !activityPending, "linked-runs": !linkedRunsPending, runtime: runtimeSelectionKnown });
+  }, [issueId, issueQueryRef, activityPending, linkedRunsPending, runtimeSelectionKnown]);
   const retryFailedRun = useMutation({
     mutationFn: async (runId: string) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
@@ -1680,11 +1685,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         sequence: number;
         anchorMs: number;
         kind: "run_start" | "steer";
+        queueIds: Set<string>;
       }
     >();
 
     for (const run of resolvedLinkedRuns) {
       agentIdByRunId.set(run.runId, run.agentId);
+      if (run.status === "queued" || !run.startedAt) continue;
       const batchedIds = Array.isArray(run.wakeCommentIds)
         ? run.wakeCommentIds.filter(
             (value): value is string =>
@@ -1704,6 +1711,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       const anchorMs = new Date(anchorAt).getTime();
       inputIds.forEach((commentId, sequence) => {
         const existing = inputPlacementByCommentId.get(commentId);
+        const queueIds = existing?.queueIds ?? new Set<string>();
+        if (run.wakeupRequestId) queueIds.add(run.wakeupRequestId);
+        if (Array.isArray(run.queuedCommentSourceWakeIds)) {
+          for (const queueId of run.queuedCommentSourceWakeIds) queueIds.add(queueId);
+        }
         if (existing && existing.anchorMs <= anchorMs) return;
         inputPlacementByCommentId.set(commentId, {
           runId: run.runId,
@@ -1711,8 +1723,31 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           sequence,
           anchorMs,
           kind: "run_start",
+          queueIds,
         });
       });
+    }
+    for (const run of [resolvedActiveRun, ...resolvedLiveRuns]) {
+      if (!run || run.status !== "running" || !run.startedAt) continue;
+      const anchorAt = new Date(run.startedAt).toISOString();
+      for (const commentId of [run.contextCommentId, run.contextWakeCommentId]) {
+        if (!commentId) continue;
+        const existing = inputPlacementByCommentId.get(commentId);
+        const queueIds = existing?.queueIds ?? new Set<string>();
+        if (run.wakeupRequestId) queueIds.add(run.wakeupRequestId);
+        if (Array.isArray(run.queuedCommentSourceWakeIds)) {
+          for (const queueId of run.queuedCommentSourceWakeIds) queueIds.add(queueId);
+        }
+        if (existing) continue;
+        inputPlacementByCommentId.set(commentId, {
+          runId: run.id,
+          anchorAt,
+          sequence: 0,
+          anchorMs: new Date(anchorAt).getTime(),
+          kind: "run_start",
+          queueIds,
+        });
+      }
     }
     // Same-turn steering has a durable PRP acknowledgement and a matching
     // activity fact keyed by commentId/targetRunId. Its acknowledgement time,
@@ -1750,6 +1785,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         sequence,
         anchorMs,
         kind: "steer",
+        queueIds: inputPlacementByCommentId.get(commentId)?.queueIds ?? new Set(),
       });
     }
     for (const [commentId, placement] of localSteeringPlacements) {
@@ -1760,6 +1796,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         sequence: placement.sequence,
         anchorMs: new Date(placement.anchorAt).getTime(),
         kind: "steer",
+        queueIds: new Set(),
       });
     }
     for (const evt of resolvedActivity) {
@@ -1871,6 +1908,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         ...(inputPlacement
           ? {
               consumedByRunId: inputPlacement.runId,
+              consumedQueueIds: [...inputPlacement.queueIds],
               ...(inputPlacement.kind === "steer"
                 ? { steeredIntoRunId: inputPlacement.runId }
                 : {}),
@@ -1886,8 +1924,14 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         locallyQueuedCommentRunIds.get(comment.id) ??
         nextComment.queueTargetRunId ??
         null;
-      if (inputPlacement?.kind === "steer") {
-        return nextComment;
+      if (inputPlacement) {
+        return {
+          ...nextComment,
+          clientStatus: undefined,
+          queueState: undefined,
+          queueTargetRunId: null,
+          queueReason: undefined,
+        };
       }
       const locallyQueuedComment = applyLocalQueuedIssueCommentState(
         nextComment,
@@ -2038,23 +2082,39 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     queuedCommentReason,
     resolvedActivity,
     resolvedLinkedRuns,
+    resolvedActiveRun,
+    resolvedLiveRuns,
     interruptibleIssueRun,
   ]);
   const effectiveQueuedCommentQueue = useMemo(() => {
     if (!queuedCommentQueueEnabled) return null;
+    const deliveredCommentRunIds = new Map<string, string>();
+    const deliveredCommentQueueIds = new Map<string, string[]>();
+    for (const comment of commentsWithRunMeta) {
+      if (comment.consumedByRunId) {
+        deliveredCommentRunIds.set(comment.id, comment.consumedByRunId);
+        deliveredCommentQueueIds.set(comment.id, comment.consumedQueueIds ?? []);
+      }
+    }
     const visibleAuthoritativeQueue = authoritativeQueuedCommentQueue
       ? {
           ...authoritativeQueuedCommentQueue,
           entries: authoritativeQueuedCommentQueue.entries.filter(
             (entry) =>
               !consumedQueuedCommentIds.has(entry.comment.id) &&
-              !discardedQueuedCommentIds.has(entry.comment.id),
+              !discardedQueuedCommentIds.has(entry.comment.id) &&
+              !deliveredCommentQueueIds.get(entry.comment.id)?.includes(
+                authoritativeQueuedCommentQueue.queueId ?? "",
+              ) &&
+              deliveredCommentRunIds.get(entry.comment.id) !==
+                authoritativeQueuedCommentQueue.targetRunId,
           ),
         }
       : null;
     const pendingComments = commentsWithRunMeta.flatMap((comment) => {
       if (
         consumedQueuedCommentIds.has(comment.id) ||
+        deliveredCommentRunIds.has(comment.id) ||
         discardedQueuedCommentIds.has(comment.id) ||
         comment.steeredIntoRunId
       ) {
@@ -3306,6 +3366,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     isError: workProductsError,
     refetch: refetchWorkProducts,
   } = useIssueWorkProducts(issueId);
+  useEffect(() => {
+    recordIssueDetailReadiness({ issue: !!loadedIssue, comments: !commentsLoading, interactions: !interactionsLoading, attachments: !attachmentsLoading, "work-products": !workProductsLoading });
+  }, [issueId, loadedIssue, commentsLoading, interactionsLoading, attachmentsLoading, workProductsLoading]);
 
   const { data: liveRunCount = 0 } = useQuery<LiveRunForIssue[], Error, number>(
     {

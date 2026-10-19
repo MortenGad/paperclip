@@ -18,6 +18,7 @@ import { ApiError } from "../api/client";
 import { aiConnectionsApi } from "../api/ai-connections";
 import { CodexLocalConfigFields } from "../adapters/codex-local/config-fields";
 import type { AdapterConfigFieldsProps } from "../adapters/types";
+import { buildClaudeLocalConfig } from "@paperclipai/adapter-claude-local/ui";
 import { DEFAULT_CODEX_LOCAL_MODEL } from "@paperclipai/adapter-codex-local";
 
 const mockAgentsApi = vi.hoisted(() => ({
@@ -73,9 +74,14 @@ vi.mock("../api/agents", () => ({
   agentsApi: mockAgentsApi,
 }));
 
-vi.mock("../api/adapters", () => ({
-  adaptersApi: { list: async () => [{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }] },
+vi.mock("../api/grokBot", () => ({
+  grokBotApi: {
+    connection: async () => ({ enabled: true, canConfigureConnection: true, binding: null }),
+  },
 }));
+
+const mockAdaptersApi = vi.hoisted(() => ({ list: vi.fn(async () => [{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }]) }));
+vi.mock("../api/adapters", () => ({ adaptersApi: mockAdaptersApi }));
 
 vi.mock("../api/environments", () => ({
   environmentsApi: mockEnvironmentsApi,
@@ -312,6 +318,7 @@ async function renderForm(
   options: {
     showAdapterTestEnvironmentButton?: boolean;
     showAdapterTypeField?: boolean;
+    compactTestFeedback?: boolean;
     content?: "configuration" | "secrets";
     environmentVariablesPlacement?: "configuration" | "secrets";
     hideInlineSave?: boolean;
@@ -335,6 +342,7 @@ async function renderForm(
         agent={makeAgent(agentOverrides)}
         onSave={onSave}
         hidePromptTemplate
+        compactTestFeedback={options.compactTestFeedback}
         content={options.content}
         environmentVariablesPlacement={options.environmentVariablesPlacement}
         hideInlineSave={options.hideInlineSave}
@@ -632,6 +640,37 @@ async function flushUntil(check: () => boolean, timeoutMs = 4000) {
 describe("AgentConfigForm environment selector", () => {
   let roots: Root[] = [];
 
+  it.each(["paperclip", "legacy"] as const)("uses the resolved %s Claude form to preserve the correct turn limit", async defaultRunner => {
+    mockAdaptersApi.list.mockResolvedValue([{ type: "claude_local", supportedRunners: defaultRunner === "paperclip" ? ["paperclip", "legacy"] : ["legacy"], defaultRunner }]);
+    try {
+      const values = { ...defaultCreateValues, adapterType: "claude_local", runner: "auto" as const };
+      const result = await renderCreateForm([], values);
+      roots.push(result.root);
+      const resolved = result.onChange.mock.calls.reduce((current, [patch]) => ({ ...current, ...patch }), values);
+      expect(resolved.resolvedRunner).toBe(defaultRunner);
+      const config = buildClaudeLocalConfig(resolved);
+      if (defaultRunner === "legacy") expect(config.maxTurnsPerRun).toBe(1000);
+      else expect(config).not.toHaveProperty("maxTurnsPerRun");
+      expect(config).not.toHaveProperty("resolvedRunner");
+    } finally { mockAdaptersApi.list.mockResolvedValue([{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }]); }
+  });
+
+
+  it("carries a selected native Claude permission through the ordinary creation builder", async () => {
+    mockAdaptersApi.list.mockResolvedValue([{ type: "claude_local", supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" }]);
+    try {
+      const values = { ...defaultCreateValues, adapterType: "claude_local", runner: "auto" as const };
+      const result = await renderCreateForm([], values);
+      roots.push(result.root);
+      await clickElement(result.container.querySelector('[aria-label="Permission mode"]'));
+      const deny = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(option => option.textContent === "Deny all");
+      expect(deny).toBeTruthy();
+      await clickElement(deny);
+      const resolved = result.onChange.mock.calls.reduce((current, [patch]) => ({ ...current, ...patch }), values);
+      expect(buildClaudeLocalConfig(resolved)).toMatchObject({ acpxPermissionMode: "deny-all" });
+    } finally { mockAdaptersApi.list.mockResolvedValue([{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }]); }
+  });
+
   it("keeps an explicit Codex draft policy until a harness reset clears it", async () => {
     mockEnvironmentsApi.list.mockResolvedValue([]);
     const container = document.createElement("div");
@@ -676,6 +715,21 @@ describe("AgentConfigForm environment selector", () => {
     await flushReact();
     await clickByText(result.container, "Save");
     expect(result.onSave).toHaveBeenCalledWith({ name: "Renamed Cody" });
+  });
+
+  it.each(["codex", "claude"].flatMap(harness => ["modelReasoningEffort", "reasoningEffort", "effort"].map(key => ({ harness, key }))))("hydrates saved effort and clears explicit Auto for $harness ($key)", async ({ harness, key }) => {
+    const profile = harness === "codex" ? { provider: "codex", model: "gpt-5.6-sol" } : { provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5" };
+    const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig: { ...profile, [key]: "high" } });
+    roots.push(result.root);
+    const effort = result.container.querySelector('[aria-label="Thinking effort"]');
+    expect(effort?.textContent).toContain("High");
+    await clickElement(effort);
+    await clickElement(document.querySelector('[role="option"][data-value=""]'));
+    await clickByText(result.container, "Save");
+    const saved = result.onSave.mock.calls[0][0];
+    expect(saved.replaceAdapterConfig).toBe(true);
+    expect(saved.adapterConfig).toMatchObject(profile);
+    for (const alias of ["modelReasoningEffort", "reasoningEffort", "effort"]) expect(saved.adapterConfig).not.toHaveProperty(alias);
   });
 
   it.each(["codex_local", "paperclip_runner"])("changes and clears the environment without changing a saved %s runner or account", async adapterType => {
@@ -740,7 +794,23 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.onSave.mock.calls[0][0].runner).toBeUndefined();
   });
 
-  it.each([{ provider: "opencode", model: "openrouter/anthropic/claude-sonnet-4.6" }, { provider: "acpx", acpxAgent: "claude" }, { provider: "unknown-provider" }])("preserves saved native $provider configuration with the experimental gate off", async adapterConfig => {
+  it("shows Claude's saved runner without legacy command controls when the experimental gate is off", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableNativeRunner: false });
+    const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5", modelReasoningEffort: "high" } }, { showAdapterTypeField: true });
+    roots.push(result.root);
+    expect(result.container.querySelector('[aria-label="Harness"]')?.textContent).toContain("Claude");
+    await clickByText(result.container, "Advanced");
+    expect(result.container.querySelector('[aria-label="Runner"]')?.textContent).toContain("Paperclip Runner");
+    const labels = Array.from(result.container.querySelectorAll("label")).map(label => label.textContent?.trim());
+    expect(labels).not.toContain("Command");
+    expect(labels).not.toContain("Extra args (comma-separated)");
+    await act(async () => setInputValue(result.container.querySelector<HTMLInputElement>('[placeholder="Agent name"]')!, "Renamed Claude"));
+    await flushReact();
+    await clickByText(result.container, "Save");
+    expect(result.onSave).toHaveBeenCalledWith({ name: "Renamed Claude" });
+  });
+
+  it.each([{ provider: "opencode", model: "openrouter/anthropic/claude-sonnet-4.6" }, { provider: "unknown-provider" }])("preserves saved native $provider configuration with the experimental gate off", async adapterConfig => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableNativeRunner: false });
     const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig }, { showAdapterTypeField: true });
     roots.push(result.root);
@@ -841,6 +911,25 @@ describe("AgentConfigForm environment selector", () => {
     vi.clearAllMocks();
   });
 
+  it.each([false, true])("uses Grok connection verification without native controls (compact: %s)", async compactTestFeedback => {
+    const result = await renderForm([], {
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "grok_bot", cwd: "/old/local/path", model: "old-model" },
+    }, { showAdapterTypeField: true, showAdapterTestEnvironmentButton: true, compactTestFeedback });
+    roots.push(result.root);
+
+    expect(result.container.querySelector('[aria-label="Grok Bot connection"]')).not.toBeNull();
+    expect(result.container.textContent).toContain("Reconnect agent access");
+    expect(result.container.querySelector('[data-config-section="adapter"]')?.textContent).toContain("Grok Bot");
+    expect(result.container.querySelector('[aria-label="Model"]')).toBeNull();
+    expect(result.container.textContent).not.toContain("AI connection");
+    expect(result.container.textContent).not.toContain("Working directory");
+    expect(result.container.textContent).not.toContain("Test your agent");
+    expect(findButton(result.container, "Test")).toBeUndefined();
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+    expect(mockAgentsApi.testEnvironment).not.toHaveBeenCalled();
+  });
+
   it("promotes environment drafts through the page Save action and discards them through the page Discard action", async () => {
     const dirty = vi.fn();
     let save: (() => void) | null = null;
@@ -888,7 +977,7 @@ describe("AgentConfigForm environment selector", () => {
 
   it.each([
     ["Codex", "codex", undefined, DEFAULT_CODEX_LOCAL_MODEL],
-    ["ACP agents", "acpx", "claude", "claude-sonnet-5"],
+    ["ACP agents", "acpx", "claude", "claude-opus-5-5"],
     ["Claude Managed", "claude_managed", undefined, "claude-sonnet-5"],
   ])("saves the %s harness default without the previous OpenCode model prefix", async (label, provider, acpxAgent, model) => {
     const accountList = vi.spyOn(aiConnectionsApi, "list").mockResolvedValue({
@@ -946,6 +1035,8 @@ describe("AgentConfigForm environment selector", () => {
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
     ]);
     roots.push(result.root);
+
+    expect(result.container.textContent).not.toContain("Secret access");
 
     expect(result.container.textContent).not.toContain("Environment override");
     expect(result.container.querySelector('[aria-label="Environment override"]')).toBeNull();
@@ -1029,24 +1120,62 @@ describe("AgentConfigForm environment selector", () => {
     });
   });
 
+  it.each(["modelReasoningEffort", "reasoningEffort", "effort"])("clears native Claude %s when the model does not support it", async key => {
+    mockAgentsApi.adapterModels.mockResolvedValue([
+      { id: "claude-opus-5-5", label: "claude-opus-5-5" },
+      { id: "claude-haiku-4-5", label: "claude-haiku-4-5" },
+    ]);
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      {
+        adapterType: "paperclip_runner",
+        adapterConfig: {
+          provider: "acpx", acpxAgent: "claude",
+          model: "claude-opus-5-5",
+          [key]: "max",
+        },
+      },
+    );
+    roots.push(result.root);
+
+    const modelButton = Array.from(result.container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "claude-opus-5-5");
+    expect(modelButton).not.toBeUndefined();
+    await act(async () => {
+      modelButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const astraOption = Array.from(document.body.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "claude-haiku-4-5");
+    expect(astraOption).not.toBeUndefined();
+    await act(async () => {
+      astraOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const saveButton = Array.from(result.container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Save");
+    expect(saveButton).not.toBeUndefined();
+    await act(async () => {
+      saveButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(result.onSave).toHaveBeenCalledWith({
+      adapterConfig: { provider: "acpx", acpxAgent: "claude", model: "claude-haiku-4-5" },
+      replaceAdapterConfig: true,
+    });
+  });
+
   it("names the Claude default for new and existing agents without pinning it", async () => {
     const environments = [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })];
     const existing = await renderForm(environments, { adapterType: "claude_local", adapterConfig: {} });
     roots.push(existing.root);
     const created = await renderCreateForm(environments, { adapterType: "claude_local", model: "" });
     roots.push(created.root);
-    expect(existing.container.textContent).toContain("Default (claude-opus-5)");
-    expect(created.container.textContent).toContain("Default (claude-opus-5)");
+    expect(existing.container.textContent).toContain("Default (claude-opus-5-5)");
+    expect(created.container.textContent).toContain("Default (claude-opus-5-5)");
     expect(existing.onSave).not.toHaveBeenCalled();
-  });
-
-  it("keeps secret access out of the main Configuration content", async () => {
-    const result = await renderForm([
-      makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
-    ]);
-    roots.push(result.root);
-
-    expect(result.container.textContent).not.toContain("Secret access");
   });
 
   it("renders secret access as dedicated form content", async () => {
@@ -1677,21 +1806,6 @@ describe("AgentConfigForm environment selector", () => {
     expect(findButton(result.container, "Sign in")).toBeFalsy();
   });
 
-  it("starts a login session for the effective sandbox and shows the code and the authentication URL", async () => {
-    mockAgentsApi.testEnvironment.mockResolvedValue(AUTH_MISSING_RESULT);
-    const result = await renderCodexSandbox();
-    roots.push(result.root);
-
-    await runTest(result.container);
-    await startLogin(result.container);
-
-    expect(mockAgentsApi.startAdapterAuthLogin).toHaveBeenCalledWith("company-1", "codex_local", {
-      environmentId: "sandbox-1",
-    });
-    expect(result.container.textContent).toContain("WXYZ-1234");
-    expect(result.container.textContent).toContain("https://auth.example.test/device");
-  });
-
   it("shows the loading state while the session starts and the prompt is not ready", async () => {
     mockAgentsApi.testEnvironment.mockResolvedValue(AUTH_MISSING_RESULT);
     mockAgentsApi.getAdapterAuthLoginStatus.mockResolvedValue({
@@ -1789,6 +1903,12 @@ describe("AgentConfigForm environment selector", () => {
 
     await runTest(result.container);
     await startLogin(result.container);
+
+    expect(mockAgentsApi.startAdapterAuthLogin).toHaveBeenCalledWith("company-1", "codex_local", {
+      environmentId: "sandbox-1",
+    });
+    expect(result.container.textContent).toContain("WXYZ-1234");
+    expect(result.container.textContent).toContain("https://auth.example.test/device");
 
     // The Cancel button appears while the session is active.
     expect(findButton(result.container, "Cancel")).toBeTruthy();
@@ -2531,31 +2651,6 @@ describe("AgentConfigForm environment selector", () => {
     expect(findButton(result.container, "Sign in")).toBeFalsy();
   });
 
-  it("shows the authorization URL and a browser-code input for a Claude sandbox", async () => {
-    mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
-    const result = await renderClaudeSandbox();
-    roots.push(result.root);
-
-    await runTest(result.container);
-    await startLogin(result.container);
-    await flushUntil(() =>
-      (result.container.textContent ?? "").includes("https://claude.example.test/authorize"),
-    );
-
-    expect(mockAgentsApi.startClaudeSetupTokenLogin).toHaveBeenCalledWith("company-1", {
-      environmentId: "sandbox-1",
-    });
-    // The panel shows the authorization URL and a browser-code input. It never
-    // shows a server-displayed code.
-    expect(result.container.textContent).toContain("https://claude.example.test/authorize");
-    expect(
-      result.container.querySelector('input[aria-label="Browser code"]'),
-    ).toBeTruthy();
-    // The default prompt carries no advisory: a confidential transport. So the
-    // panel shows no disclaimer.
-    expect(result.container.textContent).not.toContain("not encrypted");
-  });
-
   it("shows a non-blocking disclaimer when the transport advisory is present", async () => {
     mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
     // The guarded prompt read reports a non-confidential transport. The server
@@ -2989,6 +3084,19 @@ describe("AgentConfigForm environment selector", () => {
     await flushUntil(() =>
       (result.container.textContent ?? "").includes("https://claude.example.test/authorize"),
     );
+
+    expect(mockAgentsApi.startClaudeSetupTokenLogin).toHaveBeenCalledWith("company-1", {
+      environmentId: "sandbox-1",
+    });
+    // The panel shows the authorization URL and a browser-code input. It never
+    // shows a server-displayed code.
+    expect(result.container.textContent).toContain("https://claude.example.test/authorize");
+    expect(
+      result.container.querySelector('input[aria-label="Browser code"]'),
+    ).toBeTruthy();
+    // The default prompt carries no advisory: a confidential transport. So the
+    // panel shows no disclaimer.
+    expect(result.container.textContent).not.toContain("not encrypted");
 
     expect(findButton(result.container, "Cancel")).toBeTruthy();
 
@@ -3793,6 +3901,9 @@ describe("AgentConfigForm managed-sandbox-only host surfaces", () => {
     });
     await flushReact();
     const labels = fieldLabels(result.container);
+
+    expect(labels).toContain("ACP session mode");
+    expect(labels).toContain("ACP non-interactive permissions");
     expect(labels).not.toContain("Working directory (deprecated)");
     expect(labels).not.toContain("Command");
     expect(labels).not.toContain("Execution engine");
@@ -3802,25 +3913,6 @@ describe("AgentConfigForm managed-sandbox-only host surfaces", () => {
     // The stored values stay untouched: hiding is presentation, and an import
     // that carries adapter configuration from another instance must still save.
     expect(result.container.textContent).not.toContain("/srv/agents/cody");
-  });
-
-  it("keeps the non-path ACP controls visible when the policy hides the engine choice", async () => {
-    setManagedSandboxOnly(true);
-    const result = await renderForm(
-      [makeEnvironment({ id: "managed-1", name: "Managed", driver: "sandbox", config: { provider: "daytona" } })],
-      { adapterType: "claude_local", adapterConfig: MANAGED_AGENT_CONFIG },
-    );
-    roots.push(result.root);
-
-    await act(async () => {
-      for (const button of result.container.querySelectorAll("button")) {
-        if (["Advanced", "Advanced Run Policy"].includes(button.textContent?.trim() ?? "")) button.click();
-      }
-    });
-    await flushReact();
-    const labels = fieldLabels(result.container);
-    expect(labels).toContain("ACP session mode");
-    expect(labels).toContain("ACP non-interactive permissions");
   });
 
   it("keeps the host-path fields hidden while the policy is still loading", async () => {
