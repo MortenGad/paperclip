@@ -6,6 +6,7 @@ import { accessSync, constants, readFileSync, realpathSync, statSync } from "nod
 import { createRequire } from "node:module";
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -15,6 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
+import { constants as osConstants } from "node:os";
 import { Agent as HttpAgent, createServer as createHttpServer, request as requestHttp, type IncomingMessage } from "node:http";
 import { Agent as HttpsAgent, request as requestHttps } from "node:https";
 import { getCACertificates } from "node:tls";
@@ -84,7 +86,10 @@ import {
   type OpenCodeMcpBridge,
 } from "./mcp-bridge.js";
 import { nativeMcpLaunchBinding } from "../native-mcp.js";
-import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.js";
+import {
+  materializeNativeRuntimeSkills,
+  releaseMaterializedNativeRuntimeSkills,
+} from "../runtime-context-materializer.js";
 
 export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
 export const QUALIFIED_OPENCODE_VERSION = "1.18.34" as const;
@@ -368,6 +373,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
     );
     await mkdir(root, { recursive: true, mode: 0o700 });
     await writeFile(join(root, "workspace"), `${cwd}\n`, { mode: 0o600 });
+    await removeLegacyIsolatedHomes(root);
     const trace = await createProviderTraceFileSink({
       path: this.#options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH,
       provider: "opencode",
@@ -1020,7 +1026,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
-    const tool = canonicalOpenCodeMcpToolName(call.tool);
+    // The authenticated MCP bridge has resolved this against its closed
+    // declared catalog. A second prefix strip changes legitimate operation IDs.
+    const tool = call.tool;
     const turnId = this.#activeTurnId;
     if (turnId === null)
       throw new Error("OpenCode tool call is not bound to an active turn");
@@ -1353,8 +1361,9 @@ class OpenCodeHarnessSession implements HarnessSession {
           signal: this.#abort.signal,
         });
         if (!response.ok || !response.body)
-          throw new Error(
-            `OpenCode event stream returned HTTP ${response.status}`,
+          throw Object.assign(
+            new Error(`OpenCode event stream returned HTTP ${response.status}`),
+            { httpStatus: response.status },
           );
         const outboundFrameId = this.#runtime.trace?.frame({
           direction: "client_to_provider",
@@ -1452,8 +1461,9 @@ class OpenCodeHarnessSession implements HarnessSession {
           }
           this.#mapProviderEvent(event, frameId);
         }
-        throw new Error(
-          "OpenCode event stream closed before the session became terminal",
+        throw Object.assign(
+          new Error("OpenCode event stream closed before the session became terminal"),
+          { streamClosed: true },
         );
       } catch (error) {
         if (this.#closed || this.#abort.signal.aborted) return;
@@ -1461,16 +1471,48 @@ class OpenCodeHarnessSession implements HarnessSession {
         if (attempts > 3) {
           await this.#completionSettlement;
           if (this.#closed) return;
+          const failure = await openCodeEventStreamFailure(error, this.#runtime.process);
+          if (this.#closed) return;
           this.#emit("harness.diagnostic", {
             code: "opencode_sse_failed",
             message: redact(String(error), this.#runtime.sensitiveValues),
+            failure,
           });
+          this.#failActiveTurnOnStreamLoss(failure);
           this.#events.fail(error);
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, 50 * attempts));
       }
     }
+  }
+
+  /**
+   * The event stream is the only path for this turn's terminal event. Once it
+   * is gone the turn cannot finish, so record why before the stream ends
+   * instead of leaving runnerd to close it later with no cause.
+   */
+  #failActiveTurnOnStreamLoss(failure: OpenCodeEventStreamFailure): void {
+    const turnId = this.#activeTurnId;
+    if (!turnId || this.#terminalTurns.has(turnId)) return;
+    this.#settlePendingRuntimeRequestsForTurn(turnId);
+    this.#emit(
+      "turn.failed",
+      {
+        status: "failed",
+        providerTerminalObserved: false,
+        error: {
+          code: failure.kind === "server_exited" ? "opencode_server_exited" : "opencode_event_stream_lost",
+          message: failure.kind === "server_exited"
+            ? "OpenCode stopped while the turn was running."
+            : "The OpenCode event stream failed while the turn was running.",
+          opencodeFailure: failure,
+        },
+      },
+      { turnId },
+    );
+    this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
+    this.#activeTurnId = null;
   }
 
   #mapProviderEvent(value: unknown, traceFrameId: number | null = null): void {
@@ -2246,7 +2288,9 @@ async function startRuntime(input: {
   // HOME contains a read-only skill snapshot, whose destination must be fresh.
   // Keep OpenCode's XDG data stable for provider-session recovery while giving
   // every launch (including retries and recovery) a new isolated HOME.
-  const isolatedHome = await mkdtemp(join(input.root, "home-"));
+  const homesRoot = join(input.root, OPENCODE_ISOLATED_HOMES_DIRECTORY);
+  await mkdir(homesRoot, { recursive: true, mode: 0o700 });
+  const isolatedHome = await mkdtemp(join(homesRoot, "home-"));
   await chmod(isolatedHome, 0o700);
   try {
     await materializeNativeRuntimeSkills(
@@ -2254,18 +2298,14 @@ async function startRuntime(input: {
       join(isolatedHome, ".claude", "skills"),
     );
   } catch (error) {
-    await rm(isolatedHome, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
+    await removeIsolatedHome(isolatedHome).catch(() => undefined);
     throw error;
   }
   const bridge = await startOpenCodeMcpBridge({
     tools: input.options.dynamicTools,
     handler: input.dispatch,
   }).catch(async (error) => {
-    await rm(isolatedHome, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
+    await removeIsolatedHome(isolatedHome).catch(() => undefined);
     throw error;
   });
   const assignedMcp = nativeMcpLaunchBinding(
@@ -2300,7 +2340,7 @@ async function startRuntime(input: {
   const providerProxy = modelProvider === "paperclip" && input.options.environment?.PAPERCLIP_AI_PROVIDER_URL
     ? await startOpenCodeProviderProxy(input.options.environment.PAPERCLIP_AI_PROVIDER_URL, input.options.environment.PAPERCLIP_AI_PROVIDER_KEY ?? "", providerModelId, input.options.environment).catch(async error => {
         await bridge.close().catch(() => {});
-        await rm(isolatedHome, { recursive: true, force: true }).catch(() => {});
+        await removeIsolatedHome(isolatedHome).catch(() => {});
         throw error;
       })
     : null;
@@ -2533,9 +2573,7 @@ async function startRuntime(input: {
         await rm(join(configHome, "opencode", "opencode.json"), {
           force: true,
         }).catch(() => undefined);
-        await rm(isolatedHome, { recursive: true, force: true }).catch(
-          () => undefined,
-        );
+        await removeIsolatedHome(isolatedHome).catch(() => undefined);
         if (closeInput.finalizeTrace !== false) {
           await input.trace?.finish({ reason: closeInput.reason ?? null });
         }
@@ -2550,9 +2588,7 @@ async function startRuntime(input: {
     await rm(join(configHome, "opencode", "opencode.json"), {
       force: true,
     }).catch(() => undefined);
-    await rm(isolatedHome, { recursive: true, force: true }).catch(
-      () => undefined,
-    );
+    await removeIsolatedHome(isolatedHome).catch(() => undefined);
     throw error;
   }
 }
@@ -2927,8 +2963,9 @@ function sanitizedEnvironmentKeys(): string[] {
   ];
 }
 
-function sessionRoot(
-  runtimeDirectory: string,
+export const OPENCODE_ISOLATED_HOMES_DIRECTORY = "homes";
+
+export function opencodeRuntimeSessionDirectoryName(
   normalizedSessionId: string,
 ): string {
   const safe = normalizedSessionId
@@ -2936,7 +2973,35 @@ function sessionRoot(
     .slice(0, 120);
   if (!safe || safe === "." || safe === "..")
     throw new Error("Invalid normalized OpenCode session id");
-  return join(resolve(runtimeDirectory), safe);
+  return safe;
+}
+
+function sessionRoot(
+  runtimeDirectory: string,
+  normalizedSessionId: string,
+): string {
+  return join(
+    resolve(runtimeDirectory),
+    opencodeRuntimeSessionDirectoryName(normalizedSessionId),
+  );
+}
+
+async function removeIsolatedHome(home: string): Promise<void> {
+  const skillsParent = await lstat(join(home, ".claude")).catch(() => null);
+  if (skillsParent?.isDirectory()) {
+    await releaseMaterializedNativeRuntimeSkills(
+      join(home, ".claude", "skills"),
+    ).catch(() => undefined);
+  }
+  await rm(home, { recursive: true, force: true });
+}
+
+async function removeLegacyIsolatedHomes(root: string): Promise<void> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("home-")) continue;
+    await removeIsolatedHome(join(root, entry.name)).catch(() => undefined);
+  }
 }
 
 function validateWorkspace(value: string): string {
@@ -3031,7 +3096,55 @@ async function waitForExit(
   });
 }
 
-export const openCodeServerDriverInternals = { parseSse };
+/** Closed vocabulary for a lost OpenCode event stream. Never provider text. */
+export interface OpenCodeEventStreamFailure {
+  kind: "server_exited" | "connection_failed" | "http_error" | "stream_closed" | "stream_error";
+  exitCode?: number;
+  signal?: string;
+  connectionError?: string;
+  httpStatus?: number;
+}
+
+const OPENCODE_CONNECTION_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
+  "UND_ERR_SOCKET", "UND_ERR_CLOSED", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+function connectionErrorCode(error: unknown): string | undefined {
+  // undici reports `TypeError: fetch failed` and keeps the socket error in `cause`.
+  for (let current = error, depth = 0; current && depth < 4; current = record(current).cause, depth += 1) {
+    const code = record(current).code;
+    if (typeof code === "string") return OPENCODE_CONNECTION_ERROR_CODES.has(code) ? code : "unrecognized";
+  }
+  return undefined;
+}
+
+async function openCodeEventStreamFailure(
+  error: unknown,
+  process: ChildProcess,
+): Promise<OpenCodeEventStreamFailure> {
+  const connectionError = connectionErrorCode(error);
+  // A refused or reset connection usually means `opencode serve` has died.
+  // Give its exit a moment to be observed so the cause is the exit itself.
+  if (connectionError) await waitForExit(process, 1_000);
+  if (process.exitCode !== null || process.signalCode !== null) {
+    return {
+      kind: "server_exited",
+      ...(process.exitCode !== null ? { exitCode: process.exitCode } : {}),
+      ...(process.signalCode !== null && process.signalCode in osConstants.signals ? { signal: process.signalCode } : {}),
+      ...(connectionError ? { connectionError } : {}),
+    };
+  }
+  const httpStatus = record(error).httpStatus;
+  if (typeof httpStatus === "number" && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599)
+    return { kind: "http_error", httpStatus };
+  if (connectionError) return { kind: "connection_failed", connectionError };
+  if (record(error).streamClosed === true) return { kind: "stream_closed" };
+  return { kind: "stream_error" };
+}
+
+export const openCodeServerDriverInternals = { parseSse, openCodeEventStreamFailure };
 
 class AsyncQueue<T> implements AsyncIterable<T> {
   #items: T[] = [];

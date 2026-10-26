@@ -31,6 +31,7 @@ export async function testAgentSetup(input: {
   );
   if (
     input.aiConnection?.mode === "router" ||
+    runtime.checks.some(check => check.code.startsWith("environment_agent_")) ||
     runtime.status === "fail" ||
     runtime.checks.some(
       (check) => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE,
@@ -109,7 +110,9 @@ export function describeSetupFailure(
     checks?.find((candidate) => candidate.level === "error") ??
     checks?.find(
       (candidate) =>
-        candidate.code.includes("hello_probe") && candidate.level === "warn",
+        (candidate.code.includes("hello_probe") ||
+          candidate.code.startsWith("environment_agent_")) &&
+        candidate.level === "warn",
     );
   if (!check) return undefined;
   // Probe details can echo provider stderr; redact before display and bound

@@ -1,4 +1,8 @@
 export const queryKeys = {
+  agentCommentary: {
+    list: (companyId: string, filters: object) => ["agent-commentary", companyId, "list", filters] as const,
+    detail: (companyId: string, id: string | null) => ["agent-commentary", companyId, "detail", id] as const,
+  },
   skillSources: {
     projects: (companyId: string) => ['project-skill-repositories', companyId] as const,
     preview: (companyId: string, repositoryUrl: string, connectionId: string | null, commitSha: string | null, skillPath: string, filePath: string) => ['skill-sources', companyId, 'preview', repositoryUrl, connectionId, commitSha, skillPath, filePath] as const,
@@ -218,6 +222,7 @@ export const queryKeys = {
       ["team-catalog", "installed", companyId] as const,
   },
   agents: {
+    projectAccess: (id: string) => ["agents", "detail", id, "project-access"] as const,
     identity: (id: string) => ["agents", "identity", id] as const,
     list: (companyId: string) => ["agents", companyId] as const,
     detail: (id: string) => ["agents", "detail", id] as const,
@@ -507,6 +512,7 @@ export const queryKeys = {
     accessMembers: (id: string) => ["projects", "access-members", id] as const,
   },
   cases: {
+    handoffs: (id: string) => ["cases", "handoffs", id] as const,
     list: (companyId: string) => ["cases", companyId] as const,
     detail: (id: string) => ["cases", "detail", id] as const,
     documents: (id: string) => ["cases", "documents", id] as const,

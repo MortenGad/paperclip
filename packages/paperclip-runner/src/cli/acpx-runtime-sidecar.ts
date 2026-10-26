@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import { resolveClaudeEffort } from "../drivers/acpx/claude-effort.js";
 import { parseProviderMode } from "../contracts/provider-mode.js";
 import { acpxProfileActivity, type AcpxActivityAdapter, type AcpxToolEvidence } from "../drivers/acpx/profile-activity.js";
@@ -36,7 +37,7 @@ import {
   normalizeAcpFormElicitation,
   type NormalizedAcpForm,
 } from "../drivers/acpx/acp-question-adapter.js";
-import { openCodexAcpxRuntime } from "../drivers/acpx/codex-runtime-adapter.js";
+import { openCodexAcpxRuntime, AcpxProviderProcessLostError } from "../drivers/acpx/codex-runtime-adapter.js";
 import { AcpxApprovalRequiredError } from "../drivers/acpx/permission-policy.js";
 import { normalizeAcpxPermission, type NormalizedAcpxPermission } from "../drivers/acpx/acp-permission-adapter.js";
 import { acpxGoalProjection } from "../drivers/acpx/session-goals.js";
@@ -304,11 +305,22 @@ async function dispatch(
         providerPolicy: params.providerPolicy,
         systemInstructions: params.systemInstructions,
         runtimeContext: params.runtimeContext,
-        environment: createAcpxSidecarHostEnvironment(process.env, params.agent, params.normalizedSessionId),
+        environment: params.agent === "claude" ? {
+          ...createAcpxSidecarHostEnvironment(process.env, params.agent, params.normalizedSessionId),
+          // Claude's HTTP MCP client otherwise aborts at 60s, before the
+          // native Runner connection lease. Cancellation and Runner shutdown
+          // still revoke the pending call; this is not a new authority lease.
+          MCP_TOOL_TIMEOUT: String(60 * 60 * 1_000),
+        } : createAcpxSidecarHostEnvironment(process.env, params.agent, params.normalizedSessionId),
         expectedIdentity: params.expectedIdentity,
+        assignedMcpTransport: "prp",
         semanticTools: {
           tools: params.tools,
           handler: waitForTool,
+          // These calls are durable PRP requests. A controller outage must not
+          // turn a queued write into a provider-visible failure and retry.
+          // Runner lease expiry, turn cancellation and bridge close own them.
+          timeoutMs: null,
           ...(params.agent === "copilot" ? { captureSemanticReceipt: () => activeCopilotEvidence?.captureSemanticReceipt() } : {}),
         },
         onGoalUpdate: (goal) => {
@@ -682,7 +694,7 @@ async function pumpTurn(
     terminal = {
       status: "failed",
       error: {
-        ...(error instanceof AcpxApprovalRequiredError ? { code: error.code } : {}),
+        ...(error instanceof AcpxApprovalRequiredError || error instanceof AcpxProviderProcessLostError ? { code: error.code } : {}),
         message: safeMessage(error),
         retryable: false,
       },
@@ -1531,7 +1543,7 @@ function safeText(value: unknown, maxBytes = 8_192): string {
 }
 
 function redactSecrets(value: string): string {
-  return value.replace(
+  return redactObservabilityDiagnostic(value, process.env).replace(
     /(key|token|secret|password|authorization)\s*[:=]\s*[^\s,}\]]+/gi,
     "$1=[REDACTED]",
   );

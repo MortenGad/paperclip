@@ -23,6 +23,7 @@ import {
 export interface CodexNativeSessionBackendOptions {
   /** Effective provider environment, including the assigned workspace boundary. */
   environment?: NodeJS.ProcessEnv;
+  observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   /** Filesystem that authoritatively admits the workspace path. */
   workingDirectoryAuthority?: CodexWorkingDirectoryAuthority;
   runnerInstanceId?: string;
@@ -107,7 +108,8 @@ function createTransportBackedNativeSessionBackend(
   options: CodexNativeSessionBackendOptions,
 ): NativeSessionBackend {
   if (
-    options.workingDirectoryAuthority === "remote_runner" &&
+    (options.workingDirectoryAuthority === "remote_runner" ||
+      options.workingDirectoryAuthority === "runner_prepared_launch") &&
     !options.transportFactory
   ) {
     throw new Error(
@@ -152,6 +154,8 @@ function createTransportBackedNativeSessionBackend(
   return new HarnessDriverBackend(
     new CodexAppServerDriver({
       ...(input.provider.model ? { model: input.provider.model } : {}),
+      ...(input.provider.kind === "codex" && "webSearch" in input.provider && input.provider.webSearch === "disabled"
+        ? { disableWebSearch: true } : {}),
       ...(input.provider.kind === "codex" && "reasoningEffort" in input.provider && input.provider.reasoningEffort
         ? { reasoningEffort: input.provider.reasoningEffort }
         : {}),
@@ -191,6 +195,7 @@ function createTransportBackedNativeSessionBackend(
       dynamicToolHandler: options.dynamicToolHandler,
       completionFeedback: options.completionFeedback,
       environment: options.environment,
+      observability: options.observability,
       workingDirectoryAuthority: options.workingDirectoryAuthority,
       driverIdentity,
       capabilities: isCodex
