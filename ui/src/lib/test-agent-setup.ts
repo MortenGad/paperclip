@@ -78,29 +78,6 @@ export async function testAgentSetup(input: {
 
 const MAX_FAILURE_DETAIL_LENGTH = 300;
 
-/** Probe details are often a provider's raw JSON error line; show only its message. */
-function readableCheckDetail(detail: string): string {
-  const trimmed = detail.trim();
-  try {
-    const parsed = JSON.parse(trimmed) as {
-      message?: unknown;
-      error?: { message?: unknown } | string;
-    };
-    const message =
-      typeof parsed.error === "object" && typeof parsed.error?.message === "string"
-        ? parsed.error.message
-        : typeof parsed.error === "string"
-          ? parsed.error
-          : typeof parsed.message === "string"
-            ? parsed.message
-            : null;
-    if (message?.trim()) return message.trim();
-  } catch {
-    // Not JSON; use the detail text as-is.
-  }
-  return trimmed;
-}
-
 /** Describe the failing setup check, including the provider's reason when the
  * adapter reported one, so the user knows what to fix. */
 export function describeSetupFailure(
@@ -115,11 +92,10 @@ export function describeSetupFailure(
         candidate.level === "warn",
     );
   if (!check) return undefined;
-  // Probe details can echo provider stderr; redact before display and bound
-  // the length after redaction.
-  const detail = check.detail
-    ? redactDiagnosticText(readableCheckDetail(check.detail))
-    : "";
+  // Adapters own turning provider output into readable detail text. Probe
+  // details can still echo stderr, so redact before display and bound the
+  // length after redaction.
+  const detail = check.detail ? redactDiagnosticText(check.detail.trim()) : "";
   if (!detail || detail === check.message) return check.message;
   const clipped =
     detail.length > MAX_FAILURE_DETAIL_LENGTH

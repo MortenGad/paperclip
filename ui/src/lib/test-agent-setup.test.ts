@@ -117,7 +117,7 @@ it("preserves runtime warnings after a successful provider request", async () =>
     .mockResolvedValueOnce(ready);
   expect((await testAgentSetup(input)).status).toBe("warn");
 });
-it("adds the provider's JSON error message to a failed probe", () => {
+it("appends the adapter's detail to a failed probe", () => {
   expect(
     describeSetupFailure([
       { code: "runtime", level: "info", message: "Ready" },
@@ -125,8 +125,7 @@ it("adds the provider's JSON error message to a failed probe", () => {
         code: "codex_hello_probe_failed",
         level: "error",
         message: "Codex hello probe failed.",
-        detail:
-          '{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Upgrade Codex to use this model."}}',
+        detail: "Upgrade Codex to use this model.",
       },
     ]),
   ).toBe("Codex hello probe failed. Upgrade Codex to use this model.");
