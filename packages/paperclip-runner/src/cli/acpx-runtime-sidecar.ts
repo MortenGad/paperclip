@@ -1,7 +1,10 @@
 #!/usr/bin/env node
+import { resolveGrokDisableWebSearch } from "../drivers/acpx/grok-web-search.js";
 import { redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import { resolveClaudeEffort } from "../drivers/acpx/claude-effort.js";
+import { resolveGrokEffort } from "../drivers/acpx/grok-effort.js";
 import { parseProviderMode } from "../contracts/provider-mode.js";
+import { assertAcpxExecutionAdmission, parseAcpxCandidateStartupAdmission, type AcpxCandidateStartupAdmission } from "../drivers/acpx/candidate-admission.js";
 import { acpxProfileActivity, type AcpxActivityAdapter, type AcpxToolEvidence } from "../drivers/acpx/profile-activity.js";
 
 import { resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
@@ -43,6 +46,7 @@ import { normalizeAcpxPermission, type NormalizedAcpxPermission } from "../drive
 import { acpxGoalProjection } from "../drivers/acpx/session-goals.js";
 import { acpxProviderSessionIdentity } from "../drivers/acpx/recovery-identity.js";
 import {
+  assertAcpxProfileReleased,
   resolveQualifiedAcpxProfile,
   type QualifiedAcpxAgent,
 } from "../drivers/acpx/qualified-profiles.js";
@@ -167,6 +171,7 @@ let pendingInput = Promise.resolve();
 let bootstrapFailure: Error | null = null;
 let initializedAgent: QualifiedAcpxAgent | null = null;
 let initializedModel: string | null = null;
+let initializedCandidateAdmission: AcpxCandidateStartupAdmission | undefined;
 let inputClosed = false;
 const tools = new Map<string, PendingTool>();
 const normalizingTools = new Set<string>();
@@ -254,11 +259,14 @@ async function dispatch(
   if (request.command === "initialize") {
     if (initializedModel)
       throw new Error("ACPX sidecar is already initialized");
-    const agent = requireQualifiedAgent(request.params.agent);
     const model = requiredText(request.params.model, "model");
+    const candidateAdmission = request.params.candidateAdmission === undefined ? undefined
+      : parseAcpxCandidateStartupAdmission(request.params.candidateAdmission, { agent: String(request.params.agent), model });
+    const agent = requireQualifiedAgent(request.params.agent, model, candidateAdmission);
     const profile = resolveQualifiedAcpxProfile(agent, model);
     initializedAgent = agent;
     initializedModel = model;
+    initializedCandidateAdmission = candidateAdmission;
     return {
       protocolVersion: ACPX_SIDECAR_PROTOCOL_VERSION,
       sidecarPid: process.pid,
@@ -287,11 +295,13 @@ async function dispatch(
     if (
       params.agent !== initializedAgent ||
       params.model !== initializedModel
+      || canonicalJson(params.candidateAdmission ?? null) !== canonicalJson(initializedCandidateAdmission ?? null)
     ) {
       throw new Error("ACPX session profile differs from its initialization");
     }
     const openedHost = await AcpxRuntimeHost.open(
       {
+        candidateAdmission: params.candidateAdmission,
         runtimeDirectory: params.runtimeDirectory,
         normalizedSessionId: params.normalizedSessionId,
         workingDirectory: params.workingDirectory,
@@ -302,6 +312,7 @@ async function dispatch(
         mode: params.mode,
         piThinkingLevel: params.piThinkingLevel,
         claudeEffort: params.claudeEffort,
+        grokEffort: params.grokEffort, grokDisableWebSearch: params.grokDisableWebSearch,
         providerPolicy: params.providerPolicy,
         systemInstructions: params.systemInstructions,
         runtimeContext: params.runtimeContext,
@@ -372,6 +383,7 @@ async function dispatch(
       throw new Error("ACPX run tool catalog differs from the opened session");
     }
     const attachment = parseAcpxRunAttachment(request.params);
+    if (initializedCandidateAdmission) parseAcpxCandidateStartupAdmission(initializedCandidateAdmission, { agent: initializedAgent!, model: initializedModel!, runId: attachment.runId, normalizedSessionId: openParams!.normalizedSessionId });
     runId = attachment.runId;
     return {
       runId: attachment.runId,
@@ -382,6 +394,7 @@ async function dispatch(
     const activeHost = requireHost();
     if (!runId) throw new Error("attach a run before starting an ACPX turn");
     if (turnId) throw new Error("ACPX sidecar already has an active turn");
+    if (initializedCandidateAdmission) parseAcpxCandidateStartupAdmission(initializedCandidateAdmission, { agent: initializedAgent!, model: initializedModel!, runId, normalizedSessionId: openParams!.normalizedSessionId });
     const currentTurnId = boundedIdentity(request.params.turnId, "turnId");
     const activeAgent = openParams!.agent;
     turnId = currentTurnId;
@@ -1238,13 +1251,17 @@ function safeOutput(value: unknown): Record<string, unknown> {
 function parseOpenParams(
   value: Record<string, unknown>,
 ): AcpxSidecarOpenParams {
-  const fields = new Set(["runtimeDirectory", "normalizedSessionId", "workingDirectory", "agent", "model", "permissionMode", "mode", "piThinkingLevel", "claudeEffort", "permissionModePinned", "providerPolicy", "systemInstructions", "runtimeContext", "tools", "providerSessionKey", "expectedIdentity"]);
+  const fields = new Set(["runtimeDirectory", "normalizedSessionId", "workingDirectory", "agent", "model", "permissionMode", "mode", "piThinkingLevel", "claudeEffort", "grokEffort", "grokDisableWebSearch", "permissionModePinned", "providerPolicy", "systemInstructions", "runtimeContext", "tools", "providerSessionKey", "expectedIdentity", "candidateAdmission"]);
   if (Object.keys(value).some(key => !fields.has(key))) throw new Error("ACPX open parameters include an unsupported field");
-  const agent = requireQualifiedAgent(value.agent);
   const model = requiredText(value.model, "model");
+  const candidateAdmission = value.candidateAdmission === undefined ? undefined
+    : parseAcpxCandidateStartupAdmission(value.candidateAdmission, { agent: String(value.agent), model, normalizedSessionId: String(value.normalizedSessionId) });
+  const agent = requireQualifiedAgent(value.agent, model, candidateAdmission);
   if (value.mode !== undefined && agent !== "cursor") throw new Error("mode is supported only for Cursor");
   const piThinkingLevel = resolvePiThinkingLevel(agent, value.piThinkingLevel);
   const claudeEffort = resolveClaudeEffort(agent, value.claudeEffort);
+  const grokEffort = resolveGrokEffort(agent, value.grokEffort);
+  const grokDisableWebSearch = resolveGrokDisableWebSearch(agent, value.grokDisableWebSearch);
   resolveQualifiedAcpxProfile(agent, model);
   if (
     value.providerSessionKey !== undefined &&
@@ -1255,6 +1272,7 @@ function parseOpenParams(
     );
   }
   return {
+    ...(candidateAdmission ? { candidateAdmission } : {}),
     runtimeDirectory: requiredText(value.runtimeDirectory, "runtimeDirectory"),
     normalizedSessionId: boundedIdentity(
       value.normalizedSessionId,
@@ -1267,6 +1285,8 @@ function parseOpenParams(
     ...(value.mode === undefined ? {} : { mode: parseProviderMode(value.mode) }),
     ...(piThinkingLevel ? { piThinkingLevel } : {}),
     ...(claudeEffort ? { claudeEffort } : {}),
+    ...(grokEffort ? { grokEffort } : {}),
+    ...(grokDisableWebSearch === undefined ? {} : { grokDisableWebSearch }),
     permissionModePinned: value.permissionModePinned === true,
     ...(value.providerPolicy == null ? {} : { providerPolicy: parseProviderPolicy(value.providerPolicy) }),
     systemInstructions: boundedText(
@@ -1339,6 +1359,8 @@ function parseExpectedIdentity(value: unknown): AcpxExpectedSessionIdentity {
     ...(input.mode === undefined ? {} : { mode: parseProviderMode(input.mode) }),
     ...(input.piThinkingLevel === undefined ? {} : { piThinkingLevel: resolvePiThinkingLevel("pi", input.piThinkingLevel) }),
     ...(input.claudeEffort === undefined ? {} : { claudeEffort: resolveClaudeEffort("claude", input.claudeEffort) }),
+    ...(input.grokEffort === undefined ? {} : { grokEffort: resolveGrokEffort("grok", input.grokEffort) }),
+    ...(input.grokDisableWebSearch === undefined ? {} : { grokDisableWebSearch: resolveGrokDisableWebSearch("grok", input.grokDisableWebSearch) }),
     providerLifetimeFenceCandidates: requiredFenceCandidates(
       input.providerLifetimeFenceCandidates,
     ),
@@ -1444,10 +1466,12 @@ function requireHost(
   return requireSidecarCommandHost(host, activeHostCleanup, options);
 }
 
-function requireQualifiedAgent(value: unknown): QualifiedAcpxAgent {
-  if (value !== "grok" && value !== "codex" && value !== "claude" && value !== "pi" && value !== "cursor" && value !== "copilot") {
-    throw new Error("ACPX agent must be claude, codex, grok, cursor, copilot, or pi");
+function requireQualifiedAgent(value: unknown, model?: string, candidateAdmission?: AcpxCandidateStartupAdmission): QualifiedAcpxAgent {
+  if (value !== "grok" && value !== "codex" && value !== "claude" && value !== "pi" && value !== "cursor" && value !== "copilot" && value !== "antigravity") {
+    throw new Error("ACPX agent must be claude, codex, grok, cursor, copilot, pi, or antigravity");
   }
+  if (candidateAdmission) assertAcpxExecutionAdmission(resolveQualifiedAcpxProfile(value, model ?? ""), candidateAdmission);
+  else assertAcpxProfileReleased(value);
   return value;
 }
 
